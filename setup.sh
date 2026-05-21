@@ -11,12 +11,18 @@ ARCH="$(uname -m)"
 case "$ARCH" in
   aarch64|arm64)
     LINUX_ARCH="arm64"
+    GLIBC_LD_SO="ld-linux-aarch64.so.1"
+    QEMU_CMD="qemu-aarch64"
+    QEMU_PKG="qemu-user-aarch64"
     ;;
   x86_64|amd64)
     LINUX_ARCH="x64"
+    GLIBC_LD_SO="ld-linux-x86-64.so.2"
+    QEMU_CMD="qemu-x86_64"
+    QEMU_PKG="qemu-user-x86-64"
     ;;
   *)
-    echo "Error: Unsupported architecture for the current upstream workaround: $ARCH" >&2
+    echo "Error: Unsupported architecture for this installer: $ARCH" >&2
     echo "Supported Termux architectures: aarch64/arm64, x86_64/amd64" >&2
     exit 1
     ;;
@@ -30,13 +36,12 @@ NODE_BASE_DIR="${LINUX_NODE_BASE_DIR:-$HOME/node-linux}"
 NODE_INSTALL_DIR="$NODE_BASE_DIR/$LINUX_NODE_VERSION"
 LINUX_NODE="$NODE_INSTALL_DIR/bin/node"
 LINUX_NPM_CLI="$NODE_INSTALL_DIR/lib/node_modules/npm/bin/npm-cli.js"
-PRELOAD_SCRIPT="$NODE_INSTALL_DIR/copilot-preload.js"
-NODE_WRAPPER="$NODE_INSTALL_DIR/bin/node-wrapper"
+QEMU_SYSROOT="$NODE_INSTALL_DIR/qemu-sysroot"
 COPILOT_WRAPPER="$INSTALL_PREFIX/bin/copilot"
 GLIBC_PREFIX="${GLIBC_PREFIX:-$INSTALL_PREFIX/glibc}"
-GLIBC_LD_SO=""
 SSL_CERT_FILE="$INSTALL_PREFIX/etc/tls/cert.pem"
 SSL_CERT_DIR="$INSTALL_PREFIX/etc/tls/certs"
+QEMU_BIN=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -92,9 +97,35 @@ ensure_pkg() {
   pkg install -y "$pkgname"
 }
 
+resolve_qemu() {
+  QEMU_BIN="$(command -v "$QEMU_CMD" || true)"
+  if [ -z "$QEMU_BIN" ]; then
+    print_error "$QEMU_CMD not found after installing $QEMU_PKG"
+    exit 1
+  fi
+}
+
+prepare_qemu_sysroot() {
+  mkdir -p "$QEMU_SYSROOT/lib"
+
+  local lib
+  for lib in \
+    "$GLIBC_LD_SO" \
+    libc.so.6 \
+    libm.so.6 \
+    libdl.so.2 \
+    libpthread.so.0 \
+    libgcc_s.so.1 \
+    libstdc++.so.6
+  do
+    cp -Lf "$GLIBC_PREFIX/lib/$lib" "$QEMU_SYSROOT/lib/$lib"
+  done
+
+  ln -sf libc.so.6 "$QEMU_SYSROOT/lib/libc.so"
+}
+
 run_linux_node() {
   env -u LD_PRELOAD \
-    PATH="$GLIBC_PREFIX/bin:$PATH" \
     SSL_CERT_FILE="$SSL_CERT_FILE" \
     SSL_CERT_DIR="$SSL_CERT_DIR" \
     NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE" \
@@ -102,60 +133,11 @@ run_linux_node() {
     PREFIX="$INSTALL_PREFIX" \
     NPM_CONFIG_PREFIX="$INSTALL_PREFIX" \
     npm_config_prefix="$INSTALL_PREFIX" \
-    "$GLIBC_LD_SO" "$LINUX_NODE" "$@"
+    "$QEMU_BIN" -L "$QEMU_SYSROOT" "$LINUX_NODE" "$@"
 }
 
 run_linux_npm() {
   run_linux_node "$LINUX_NPM_CLI" "$@"
-}
-
-find_glibc_loader() {
-  if [ -x "$GLIBC_PREFIX/bin/ld.so" ]; then
-    GLIBC_LD_SO="$GLIBC_PREFIX/bin/ld.so"
-    return 0
-  fi
-
-  local candidate
-  for candidate in "$GLIBC_PREFIX"/lib/ld-*; do
-    if [ -e "$candidate" ]; then
-      GLIBC_LD_SO="$candidate"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-write_node_wrapper() {
-  mkdir -p "$(dirname "$NODE_WRAPPER")"
-  cat > "$NODE_WRAPPER" <<EOF
-#!/data/data/com.termux/files/usr/bin/bash
-GLIBC_PREFIX="${GLIBC_PREFIX}"
-REAL_NODE="\$(dirname "\$0")/node"
-LD_SO="${GLIBC_LD_SO}"
-export PATH="\$GLIBC_PREFIX/bin:\$PATH"
-unset LD_PRELOAD
-exec "\$LD_SO" "\$REAL_NODE" "\$@"
-EOF
-  chmod +x "$NODE_WRAPPER"
-}
-
-write_preload_script() {
-  cat > "$PRELOAD_SCRIPT" <<EOF
-const path = require('path');
-const wrapperPath = path.join(__dirname, 'bin', 'node-wrapper');
-Object.defineProperty(process, 'execPath', {
-  value: wrapperPath,
-  writable: true,
-  configurable: true,
-});
-if (
-  process.argv[0] &&
-  (process.argv[0].includes('/ld.so') || process.argv[0].includes('/ld-linux-'))
-) {
-  process.argv[0] = wrapperPath;
-}
-EOF
 }
 
 write_copilot_wrapper() {
@@ -163,19 +145,19 @@ write_copilot_wrapper() {
   cat > "$COPILOT_WRAPPER" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
-INSTALL_PREFIX="${INSTALL_PREFIX}"
-GLIBC_PREFIX="\${GLIBC_PREFIX:-${GLIBC_PREFIX}}"
-NODE_LINUX_DIR="\${NODE_LINUX_DIR:-${NODE_INSTALL_DIR}}"
-LINUX_NODE="\$NODE_LINUX_DIR/bin/node"
-PRELOAD="\$NODE_LINUX_DIR/copilot-preload.js"
-COPILOT="${INSTALL_ROOT}/npm-loader.js"
-LD_SO="\${GLIBC_LD_SO:-${GLIBC_LD_SO}}"
-export SSL_CERT_FILE="${SSL_CERT_FILE}"
-export SSL_CERT_DIR="${SSL_CERT_DIR}"
-export NODE_EXTRA_CA_CERTS="${SSL_CERT_FILE}"
-export PATH="\$GLIBC_PREFIX/bin:\$PATH"
-unset LD_PRELOAD
-exec "\$LD_SO" "\$LINUX_NODE" -r "\$PRELOAD" "\$COPILOT" "\$@"
+NODE_DIR="${NODE_INSTALL_DIR}"
+SYSROOT="\$NODE_DIR/qemu-sysroot"
+REAL_NODE="\$NODE_DIR/bin/node"
+ENTRY="${INSTALL_ROOT}/index.js"
+exec env -u LD_PRELOAD \\
+  COPILOT_RUN_APP=1 \\
+  NODE_OPTIONS="\${NODE_OPTIONS:+\$NODE_OPTIONS }--no-warnings" \\
+  SSL_CERT_FILE="${SSL_CERT_FILE}" \\
+  SSL_CERT_DIR="${SSL_CERT_DIR}" \\
+  NODE_EXTRA_CA_CERTS="${SSL_CERT_FILE}" \\
+  HOME="${HOME}" \\
+  PREFIX="${INSTALL_PREFIX}" \\
+  "${QEMU_BIN}" -L "\$SYSROOT" "\$REAL_NODE" "\$ENTRY" "\$@"
 EOF
   chmod +x "$COPILOT_WRAPPER"
 }
@@ -201,7 +183,7 @@ download_linux_node() {
 
 print_header "GitHub Copilot CLI on Termux"
 
-echo "This setup uses Termux glibc-runner plus an official Linux Node.js build."
+echo "This setup uses Linux Node.js under QEMU with a minimal glibc sysroot."
 echo ""
 echo "  • Termux arch:   $ARCH"
 echo "  • Linux arch:    $LINUX_ARCH"
@@ -227,46 +209,40 @@ print_info "Refreshing package metadata after enabling glibc repo"
 pkg update -y || print_warning "pkg update after glibc-repo failed, continuing anyway"
 
 ensure_pkg glibc-runner
+ensure_pkg "$QEMU_PKG" "$QEMU_CMD"
+resolve_qemu
 
-if ! find_glibc_loader; then
-  print_error "glibc loader not found under $GLIBC_PREFIX"
+if [ ! -r "$GLIBC_PREFIX/lib/$GLIBC_LD_SO" ]; then
+  print_error "glibc loader not found at $GLIBC_PREFIX/lib/$GLIBC_LD_SO"
   exit 1
 fi
 
 print_step "Step 1/5: Downloading Linux Node.js"
 download_linux_node
-write_node_wrapper
-write_preload_script
+prepare_qemu_sysroot
 print_success "Linux Node.js prepared under $NODE_INSTALL_DIR"
 
-print_step "Step 2/5: Installing GitHub Copilot CLI under glibc"
+print_step "Step 2/5: Verifying Linux Node.js under QEMU"
+run_linux_node --version
+print_success "Linux Node.js runs under QEMU"
 
+print_step "Step 3/5: Installing GitHub Copilot CLI"
 COPILOT_SPEC="@github/copilot"
-COPILOT_LINUX_SPEC="@github/copilot-linux-${LINUX_ARCH}"
 if [ "$COPILOT_VERSION" != "latest" ]; then
   COPILOT_SPEC="${COPILOT_SPEC}@${COPILOT_VERSION}"
-  COPILOT_LINUX_SPEC="${COPILOT_LINUX_SPEC}@${COPILOT_VERSION}"
 fi
 
-run_linux_npm install -g "$COPILOT_SPEC" "$COPILOT_LINUX_SPEC"
+NPM_CONFIG_OPTIONAL=false npm_config_optional=false run_linux_npm install -g "$COPILOT_SPEC"
 
-if [ ! -f "$INSTALL_ROOT/npm-loader.js" ]; then
+if [ ! -f "$INSTALL_ROOT/index.js" ]; then
   print_error "Install root not found at $INSTALL_ROOT after npm install"
   exit 1
 fi
-
 print_success "GitHub Copilot CLI installed under $INSTALL_ROOT"
 
-print_step "Step 3/5: Writing Termux launcher"
+print_step "Step 4/5: Writing Termux launcher"
 write_copilot_wrapper
 print_success "Installed wrapper at $COPILOT_WRAPPER"
-
-print_step "Step 4/5: Verifying Linux package install"
-if [ ! -x "$INSTALL_PREFIX/lib/node_modules/@github/copilot-linux-${LINUX_ARCH}/copilot" ]; then
-  print_error "Linux Copilot binary package missing: @github/copilot-linux-${LINUX_ARCH}"
-  exit 1
-fi
-print_success "Linux Copilot binary package detected"
 
 print_step "Step 5/5: Verifying launcher"
 "$COPILOT_WRAPPER" --version
@@ -274,10 +250,11 @@ print_success "Copilot launcher is ready"
 
 print_header "Installation Complete"
 
-echo "GitHub Copilot CLI is installed for Termux via glibc-runner."
+echo "GitHub Copilot CLI is installed for Termux."
 echo ""
 echo "Notes:"
-echo "  • The wrapper runs Copilot with Linux Node.js so upstream linux-arm64/x64 binaries load correctly."
+echo "  • The wrapper runs upstream Copilot with Linux Node.js under QEMU."
+echo "  • QEMU uses a minimal glibc sysroot copied from Termux's glibc packages."
 echo "  • If npm overwrites \$PREFIX/bin/copilot during a future update, rerun this script."
 echo ""
 echo "Next steps:"
