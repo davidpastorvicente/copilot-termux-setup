@@ -142,6 +142,7 @@ run_linux_npm() {
 
 write_copilot_wrapper() {
   mkdir -p "$(dirname "$COPILOT_WRAPPER")"
+  rm -f "$COPILOT_WRAPPER"
   cat > "$COPILOT_WRAPPER" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
