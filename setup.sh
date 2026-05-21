@@ -11,11 +11,9 @@ ARCH="$(uname -m)"
 case "$ARCH" in
   aarch64|arm64)
     LINUX_ARCH="arm64"
-    GLIBC_LD_BASENAME="ld-linux-aarch64.so.1"
     ;;
   x86_64|amd64)
     LINUX_ARCH="x64"
-    GLIBC_LD_BASENAME="ld-linux-x86-64.so.2"
     ;;
   *)
     echo "Error: Unsupported architecture for the current upstream workaround: $ARCH" >&2
@@ -36,7 +34,7 @@ PRELOAD_SCRIPT="$NODE_INSTALL_DIR/copilot-preload.js"
 NODE_WRAPPER="$NODE_INSTALL_DIR/bin/node-wrapper"
 COPILOT_WRAPPER="$INSTALL_PREFIX/bin/copilot"
 GLIBC_PREFIX="${GLIBC_PREFIX:-$INSTALL_PREFIX/glibc}"
-GLIBC_LD_SO="$GLIBC_PREFIX/lib/$GLIBC_LD_BASENAME"
+GLIBC_LD_SO=""
 SSL_CERT_FILE="$INSTALL_PREFIX/etc/tls/cert.pem"
 SSL_CERT_DIR="$INSTALL_PREFIX/etc/tls/certs"
 
@@ -111,6 +109,23 @@ run_linux_npm() {
   run_linux_node "$LINUX_NPM_CLI" "$@"
 }
 
+find_glibc_loader() {
+  if [ -x "$GLIBC_PREFIX/bin/ld.so" ]; then
+    GLIBC_LD_SO="$GLIBC_PREFIX/bin/ld.so"
+    return 0
+  fi
+
+  local candidate
+  for candidate in "$GLIBC_PREFIX"/lib/ld-*; do
+    if [ -e "$candidate" ]; then
+      GLIBC_LD_SO="$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 write_node_wrapper() {
   mkdir -p "$(dirname "$NODE_WRAPPER")"
   cat > "$NODE_WRAPPER" <<EOF
@@ -134,7 +149,10 @@ Object.defineProperty(process, 'execPath', {
   writable: true,
   configurable: true,
 });
-if (process.argv[0] && process.argv[0].includes('${GLIBC_LD_BASENAME}')) {
+if (
+  process.argv[0] &&
+  (process.argv[0].includes('/ld.so') || process.argv[0].includes('/ld-linux-'))
+) {
   process.argv[0] = wrapperPath;
 }
 EOF
@@ -210,8 +228,8 @@ pkg update -y || print_warning "pkg update after glibc-repo failed, continuing a
 
 ensure_pkg glibc-runner
 
-if [ ! -x "$GLIBC_LD_SO" ]; then
-  print_error "glibc loader not found at $GLIBC_LD_SO"
+if ! find_glibc_loader; then
+  print_error "glibc loader not found under $GLIBC_PREFIX"
   exit 1
 fi
 
